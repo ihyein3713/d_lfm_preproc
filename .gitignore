@@ -1,0 +1,36 @@
+# Data
+data/
+datasets/
+raw/
+processed/
+
+# Medical images
+*.nii
+*.nii.gz
+*.dcm
+*.mnc
+
+# Models / outputs
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+runs/
+outputs/
+results/
+logs/
+
+# Arrays / large files
+*.npy
+*.npz
+*.pkl
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environment
+.venv/
+venv/
+.env
