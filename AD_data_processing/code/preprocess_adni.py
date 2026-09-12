@@ -64,24 +64,26 @@ def discover_series(raw_dir: Path, patterns: list) -> list:
 
 
 def output_paths(dicom_dir: Path, raw_dir: Path, out_dir: Path, resolutions: list) -> dict:
-    rel = dicom_dir.relative_to(raw_dir)  # <subject>/<sequence>/<date>/<image_id>
-    base_dir = out_dir / rel
-    base = base_dir / "volume"
+    # Flattened to <subject>/<image_id>/: the sequence and visit-date levels are
+    # dropped since image_id is already unique within a subject.
+    subject_id = dicom_dir.relative_to(raw_dir).parts[0]
+    image_id = dicom_dir.name
+    base_dir = out_dir / subject_id / image_id
     paths = {
         "raw_nifti_dir": base_dir,
-        "raw_nifti_stem": "volume_step0_raw",
-        "biasfield": base.with_name("volume_step1_biasfield.nii.gz"),
-        "stripped": base.with_name("volume_step2_stripped.nii.gz"),
-        "registered": base.with_name("volume_step3_registered.nii.gz"),
-        "synthseg": base.with_name("volume_synthseg.nii.gz"),
-        "final": base.with_name("volume_final.nii.gz"),
+        "raw_nifti_stem": f"{image_id}_step0_raw",
+        "biasfield": base_dir / f"{image_id}_step1_biasfield.nii.gz",
+        "stripped": base_dir / f"{image_id}_step2_stripped.nii.gz",
+        "registered": base_dir / f"{image_id}_step3_registered.nii.gz",
+        "synthseg": base_dir / f"{image_id}_synthseg_native.nii.gz",
+        "final": base_dir / f"{image_id}_final_native.nii.gz",
         "synthseg_resampled": {},
         "final_resampled": {},
     }
     for res in resolutions:
         tag = f"{res:g}mm"
-        paths["synthseg_resampled"][res] = base.with_name(f"volume_synthseg_{tag}.nii.gz")
-        paths["final_resampled"][res] = base.with_name(f"volume_final_{tag}.nii.gz")
+        paths["synthseg_resampled"][res] = base_dir / f"{image_id}_synthseg_{tag}.nii.gz"
+        paths["final_resampled"][res] = base_dir / f"{image_id}_final_{tag}.nii.gz"
     return paths
 
 
@@ -110,7 +112,8 @@ def process_series(subject_id, dicom_dir, raw_dir, out_dir, reference_brain, res
             pipeline.resample(paths["final"], paths["final_resampled"][res], res, is_segmentation=False)
 
         if not keep_intermediates:
-            pipeline.cleanup([raw_nifti, paths["biasfield"], paths["stripped"], paths["registered"]])
+            transforms = list(paths["raw_nifti_dir"].glob(f"{paths['registered'].name}_transform_*"))
+            pipeline.cleanup([raw_nifti, paths["biasfield"], paths["stripped"], paths["registered"]] + transforms)
         if not keep_native_res:
             pipeline.cleanup([paths["synthseg"], paths["final"]])
 
