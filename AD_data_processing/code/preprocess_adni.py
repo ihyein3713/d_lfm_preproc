@@ -38,10 +38,13 @@ logger = logging.getLogger("preprocess_adni")
 # field-map/localizer/HighResHippocampus, which this T1-tuned pipeline isn't for.
 DEFAULT_T1_PATTERNS = ["MPRAGE", "MP-RAGE", "SPGR"]
 
-# mri_synthstrip runs on the GPU; a single 11GB card can't run two at once.
-# mri_synthseg currently falls back to CPU regardless (no CUDA-enabled
-# TensorFlow installed yet), so it isn't serialized through this lock.
+# mri_synthstrip and mri_synthseg both run on the GPU and share this lock:
+# SynthSeg alone peaks at ~10.7 of the 11 GB, so any overlap risks CUDA OOM.
 gpu_lock = threading.Lock()
+
+# CPU SynthStrip peaks at ~8-10 GB RSS per process on 16-25 MB inputs, so
+# several in parallel would exhaust RAM; run one at a time with more threads.
+strip_cpu_lock = threading.Lock()
 
 
 def discover_series(raw_dir: Path, patterns: list) -> list:
@@ -87,23 +90,36 @@ def output_paths(dicom_dir: Path, raw_dir: Path, out_dir: Path, resolutions: lis
     return paths
 
 
+def is_complete(paths: dict) -> bool:
+    # Intermediates are deleted once a series finishes, so the per-step existence
+    # checks alone would redo the whole chain; the resampled outputs are the marker.
+    finals = list(paths["synthseg_resampled"].values()) + list(paths["final_resampled"].values())
+    return all(p.exists() for p in finals)
+
+
 def process_series(subject_id, dicom_dir, raw_dir, out_dir, reference_brain, resolutions, gpu,
-                    keep_intermediates, keep_native_res) -> dict:
+                    keep_intermediates, keep_native_res, seg_env, strip_device, strip_threads) -> dict:
     paths = output_paths(dicom_dir, raw_dir, out_dir, resolutions)
+    start = time.time()
     try:
         raw_nifti = pipeline.dicom_to_nifti(dicom_dir, paths["raw_nifti_dir"], paths["raw_nifti_stem"])
 
         pipeline.n4_bias_correction(raw_nifti, paths["biasfield"])
 
-        if gpu:
+        if gpu and strip_device == "gpu":
             with gpu_lock:
                 pipeline.skull_strip(paths["biasfield"], paths["stripped"], gpu=True)
         else:
-            pipeline.skull_strip(paths["biasfield"], paths["stripped"], gpu=False)
+            with strip_cpu_lock:
+                pipeline.skull_strip(paths["biasfield"], paths["stripped"], gpu=False, threads=strip_threads)
 
         pipeline.register_to_reference(paths["stripped"], paths["registered"], reference_brain)
 
-        pipeline.segment(paths["registered"], paths["synthseg"], gpu=gpu)
+        if gpu:
+            with gpu_lock:
+                pipeline.segment(paths["registered"], paths["synthseg"], gpu=True, env=seg_env)
+        else:
+            pipeline.segment(paths["registered"], paths["synthseg"], gpu=False)
 
         pipeline.normalize_intensity(paths["registered"], paths["final"])
 
@@ -117,7 +133,8 @@ def process_series(subject_id, dicom_dir, raw_dir, out_dir, reference_brain, res
         if not keep_native_res:
             pipeline.cleanup([paths["synthseg"], paths["final"]])
 
-        return {"subject_id": subject_id, "input": str(dicom_dir), "status": "ok"}
+        return {"subject_id": subject_id, "input": str(dicom_dir), "status": "ok",
+                "seconds": round(time.time() - start, 1)}
     except pipeline.StepError as e:
         logger.error("failed %s: %s", dicom_dir, e)
         return {"subject_id": subject_id, "input": str(dicom_dir), "status": "failed", "step": e.step, "error": str(e)}
@@ -142,6 +159,15 @@ def main():
                          help="Concurrency for the CPU-only steps (dcm2niix, N4, registration). GPU steps are always serialized.")
     parser.add_argument("--gpu", dest="gpu", action="store_true", default=True)
     parser.add_argument("--no-gpu", dest="gpu", action="store_false")
+    parser.add_argument("--strip-device", choices=["gpu", "cpu"], default="gpu",
+                         help="Where SynthStrip runs. 'cpu' takes it out of the GPU lock so it runs in the "
+                              "CPU worker pool; SynthSeg stays on the GPU.")
+    parser.add_argument("--strip-threads", type=int, default=None,
+                         help="PyTorch CPU threads per SynthStrip process when --strip-device cpu.")
+    parser.add_argument("--tfcuda-site-packages",
+                         default=os.environ.get("TFCUDA_SITE_PACKAGES",
+                                                str(Path.home() / "miniconda3/envs/tfcuda/lib/python3.8/site-packages")),
+                         help="site-packages holding the pip nvidia-* CUDA 11.8/cuDNN 8.6 wheels that FreeSurfer's TensorFlow needs for GPU SynthSeg.")
     parser.add_argument("--keep-intermediates", action="store_true",
                          help="Keep step0_raw/step1_biasfield/step2_stripped/step3_registered instead of deleting them once a series finishes.")
     parser.add_argument("--keep-native-res", action="store_true",
@@ -187,7 +213,16 @@ def main():
 
     pipeline.require_tools()
 
+    seg_env = None
+    if args.gpu:
+        seg_env = pipeline.synthseg_gpu_env(Path(args.tfcuda_site_packages))
+        logger.info("SynthSeg GPU preflight OK: %s", pipeline.check_synthseg_gpu(seg_env))
+
     resolutions = [float(r.strip()) for r in args.resolutions.split(",") if r.strip()]
+
+    todo = [(s, d) for s, d in series if not is_complete(output_paths(d, raw_dir, out_dir, resolutions))]
+    logger.info("%d already complete, %d to process", len(series) - len(todo), len(todo))
+    series = todo
 
     if args.limit:
         series = series[: args.limit]
@@ -199,7 +234,8 @@ def main():
         futures = {
             executor.submit(
                 process_series, subject_id, dicom_dir, raw_dir, out_dir, reference_brain,
-                resolutions, args.gpu, args.keep_intermediates, args.keep_native_res,
+                resolutions, args.gpu, args.keep_intermediates, args.keep_native_res, seg_env,
+                args.strip_device, args.strip_threads,
             ): (subject_id, dicom_dir)
             for subject_id, dicom_dir in series
         }
